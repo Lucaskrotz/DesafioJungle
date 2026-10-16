@@ -7,8 +7,12 @@ export function loadConfig() {
     dbPoolMax: Number(env.DB_POOL_MAX ?? 20),
     sqsEndpoint: env.SQS_ENDPOINT ?? 'http://localhost:4566',
     awsRegion: env.AWS_REGION ?? 'us-east-1',
+    awsAccessKeyId: env.AWS_ACCESS_KEY_ID ?? 'test',
+    awsSecretAccessKey: env.AWS_SECRET_ACCESS_KEY ?? 'test',
     transactionsQueue: env.SQS_TRANSACTIONS_QUEUE ?? 'wager-transactions.fifo',
     eventsQueue: env.SQS_EVENTS_QUEUE ?? 'wager-events.fifo',
     runWorkers: (env.RUN_WORKERS ?? '1') === '1',
+    outboxPollMs: Number(env.OUTBOX_POLL_MS ?? 500),
+    pendingReferencePollMs: Number(env.PENDING_REFERENCE_POLL_MS ?? 1000),
   };
 }

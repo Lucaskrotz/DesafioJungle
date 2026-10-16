@@ -173,6 +173,6 @@ describe('health', () => {
     const live = await call('GET', '/health/live');
     expect(live).toMatchObject({ status: 200, json: { status: 'ok' } });
     const ready = await call('GET', '/health/ready');
-    expect(ready).toMatchObject({ status: 200, json: { status: 'ok', checks: { postgres: 'up' } } });
+    expect(ready).toMatchObject({ status: 200, json: { status: 'ok', checks: { postgres: 'up', sqs: 'up' } } });
   });
 });

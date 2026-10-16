@@ -22,6 +22,8 @@ export interface TransactionRepository {
   findByExternalForUpdate(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
   findByIdForUpdate(id: string): Promise<WagerTransaction | undefined>;
   hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
+  /** PENDING_REFERENCE vencidas (sem lock): candidatas do worker, que re-trava e revalida cada uma. */
+  listDuePendingReferences(limit: number, now: Date): Promise<{ id: string; walletId: string }[]>;
   /** Lança RetryableConflictError em violação de unicidade. */
   insert(tx: WagerTransaction): Promise<void>;
   update(tx: WagerTransaction): Promise<void>;

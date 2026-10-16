@@ -112,6 +112,15 @@ class MikroOrmTransactionRepository implements TransactionRepository {
     return n > 0;
   }
 
+  async listDuePendingReferences(limit: number, now: Date) {
+    const rows = await this.em.find(
+      WagerTransactionSchema,
+      { status: 'PENDING_REFERENCE', nextReferenceAttemptAt: { $lte: now } },
+      { ...FRESH, fields: ['id', 'walletId'], orderBy: { nextReferenceAttemptAt: 'asc' }, limit },
+    );
+    return rows.map((r) => ({ id: r.id, walletId: r.walletId }));
+  }
+
   async insert(tx: WagerTransaction) {
     try {
       await this.em.insert(WagerTransactionSchema, transactionToRow(tx));

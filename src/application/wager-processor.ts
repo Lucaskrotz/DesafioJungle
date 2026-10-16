@@ -40,8 +40,8 @@ export async function applyWagerTransaction(
   tx: WagerTransaction,
   mode: 'insert' | 'update',
   cx: ProcessContext,
+  now: Date = new Date(), // injetável: o worker decide vencimento/backoff com o mesmo relógio
 ): Promise<void> {
-  const now = new Date();
   const persist = () => (mode === 'insert' ? r.transactions.insert(tx) : r.transactions.update(tx));
   const emit = (make: (ctx: EventContext) => IntegrationEvent<unknown>) =>
     r.outbox.add(

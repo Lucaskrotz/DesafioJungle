@@ -1,6 +1,7 @@
 import { createApp } from './bootstrap';
 import { loadConfig } from './config';
 
-const app = await createApp();
+const config = loadConfig();
+const app = await createApp({ workers: config.runWorkers });
 app.enableShutdownHooks();
-await app.listen(loadConfig().port);
+await app.listen(config.port);
