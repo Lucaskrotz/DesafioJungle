@@ -1,13 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import {
-  CreateQueueCommand,
-  DeleteQueueCommand,
-  GetQueueAttributesCommand,
-  ReceiveMessageCommand,
-  SendMessageBatchCommand,
-  SendMessageCommand,
-  type Message,
-} from '@aws-sdk/client-sqs';
+import { SendMessageBatchCommand, type Message } from '@aws-sdk/client-sqs';
 import { TransientInfrastructureError } from '../../src/application/errors';
 import { OpenWalletUseCase } from '../../src/application/open-wallet';
 import type { UnitOfWork } from '../../src/application/ports';
@@ -23,6 +15,14 @@ import {
   type WagerConsumerOptions,
 } from '../../src/infrastructure/sqs/wager-consumer';
 import { assertWalletConsistent } from '../support/invariants';
+import {
+  deleteQueues,
+  queueCounts,
+  readDlq as readDlqMessages,
+  sendMessage,
+  tempQueues as createTempQueues,
+  type Queues,
+} from '../support/sqs';
 
 // Requer Postgres migrado e LocalStack. Cada teste usa filas FIFO temporárias (principal + DLQ com redrive).
 let orm: Orm;
@@ -40,7 +40,7 @@ beforeAll(async () => {
   sqs = new Sqs();
 });
 afterAll(async () => {
-  await Promise.all(created.map((QueueUrl) => sqs.client.send(new DeleteQueueCommand({ QueueUrl })).catch(() => undefined)));
+  await deleteQueues(sqs, created);
   sqs.client.destroy();
   await orm.close();
 });
@@ -53,66 +53,18 @@ const debitsOf = async (walletId: string) =>
 const inboxOf = (messageId: string) =>
   q(`SELECT payload_hash, processed_at FROM inbox_messages WHERE consumer_name = ? AND message_id = ?`, [CONSUMER_NAME, messageId]);
 
-type Queues = { name: string; dlqName: string; url: string; dlqUrl: string };
-async function tempQueues({ maxReceiveCount = 3, visibility = 2 } = {}): Promise<Queues> {
-  const suffix = uid();
-  const name = `wt-${suffix}.fifo`;
-  const dlqName = `wt-dlq-${suffix}.fifo`;
-  const fifo = { FifoQueue: 'true', ContentBasedDeduplication: 'false' };
-  const dlq = await sqs.client.send(new CreateQueueCommand({ QueueName: dlqName, Attributes: fifo }));
-  const arn = (await sqs.client.send(new GetQueueAttributesCommand({ QueueUrl: dlq.QueueUrl, AttributeNames: ['QueueArn'] })))
-    .Attributes!.QueueArn!;
-  const main = await sqs.client.send(
-    new CreateQueueCommand({
-      QueueName: name,
-      Attributes: {
-        ...fifo,
-        VisibilityTimeout: String(visibility),
-        RedrivePolicy: JSON.stringify({ deadLetterTargetArn: arn, maxReceiveCount: String(maxReceiveCount) }),
-      },
-    }),
-  );
-  created.push(main.QueueUrl!, dlq.QueueUrl!);
-  return { name, dlqName, url: main.QueueUrl!, dlqUrl: dlq.QueueUrl! };
+async function tempQueues(opts: { maxReceiveCount?: number; visibility?: number } = {}): Promise<Queues> {
+  const qs = await createTempQueues(sqs, opts);
+  created.push(...qs.urls);
+  return qs;
 }
 
 const consumer = (qs: Queues, opts: WagerConsumerOptions = {}, useCase = submit) =>
   new WagerConsumer(useCase, sqs, { queueName: qs.name, dlqName: qs.dlqName, waitTimeSeconds: 1, ...opts });
 
-/** MessageDeduplicationId sempre novo: o broker não deduplica, quem deduplica é o inbox. */
-const send = (url: string, body: unknown, groupId: string) =>
-  sqs.client.send(
-    new SendMessageCommand({
-      QueueUrl: url,
-      MessageBody: typeof body === 'string' ? body : JSON.stringify(body),
-      MessageGroupId: groupId,
-      MessageDeduplicationId: uid(),
-    }),
-  );
-
-async function counts(url: string) {
-  const a = (
-    await sqs.client.send(
-      new GetQueueAttributesCommand({
-        QueueUrl: url,
-        AttributeNames: ['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible'],
-      }),
-    )
-  ).Attributes!;
-  return { visible: Number(a.ApproximateNumberOfMessages), inFlight: Number(a.ApproximateNumberOfMessagesNotVisible) };
-}
-
-async function readDlq(url: string, expected: number, timeoutMs = 10_000): Promise<Message[]> {
-  const got: Message[] = [];
-  const deadline = Date.now() + timeoutMs;
-  while (got.length < expected && Date.now() < deadline) {
-    const r = await sqs.client.send(
-      new ReceiveMessageCommand({ QueueUrl: url, MaxNumberOfMessages: 10, WaitTimeSeconds: 1, VisibilityTimeout: 30, MessageAttributeNames: ['All'] }),
-    );
-    got.push(...(r.Messages ?? []));
-  }
-  return got;
-}
+const send = (url: string, body: unknown, groupId: string) => sendMessage(sqs, url, body, groupId);
+const counts = (url: string) => queueCounts(sqs, url);
+const readDlq = (url: string, expected: number, timeoutMs?: number) => readDlqMessages(sqs, url, expected, timeoutMs);
 
 /** Roda runOnce em todos os consumidores, em paralelo, até `done`. */
 async function until(cs: WagerConsumer[], done: (o: Outcome[]) => boolean, timeoutMs = 20_000): Promise<Outcome[]> {
