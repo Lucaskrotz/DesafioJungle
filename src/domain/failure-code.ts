@@ -16,6 +16,8 @@ export enum FailureCode {
   /** Tipo de referência não permitido para este kind (ex.: REFUND de WIN). */
   InvalidReferenceKind = 'INVALID_REFERENCE_KIND',
   WalletNotFound = 'WALLET_NOT_FOUND',
+  /** playerId do payload não é o dono da wallet. */
+  WalletPlayerMismatch = 'WALLET_PLAYER_MISMATCH',
   /** Erro permanente de infraestrutura (estado FAILED). */
   InfrastructureFailure = 'INFRASTRUCTURE_FAILURE',
 }

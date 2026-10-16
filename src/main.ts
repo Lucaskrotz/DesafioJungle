@@ -1,18 +1,6 @@
-import 'reflect-metadata';
-import { Controller, Get, Module } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
+import { createApp } from './bootstrap';
+import { loadConfig } from './config';
 
-@Controller('health')
-class HealthController {
-  @Get('live')
-  live() {
-    return { status: 'ok' };
-  }
-}
-
-@Module({ controllers: [HealthController] })
-class AppModule {}
-
-const app = await NestFactory.create(AppModule);
+const app = await createApp();
 app.enableShutdownHooks();
-await app.listen(Number(process.env.PORT ?? 3000));
+await app.listen(loadConfig().port);
