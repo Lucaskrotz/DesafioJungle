@@ -151,6 +151,10 @@ describe('wager_transactions: triggers', () => {
     const t = await tx(w);
     await expect(run('delete from wager_transactions where id = ?', [t.id])).rejects.toThrow('cannot be deleted');
   });
+  test('TRUNCATE falha (inclusive com CASCADE)', async () => {
+    // sem CASCADE a FK do ledger já barra; o trigger próprio cobre quem derruba as referências
+    await expect(run('truncate wager_transactions cascade')).rejects.toThrow(/cannot be truncated|append-only/);
+  });
   test('PENDING_REFERENCE -> PROCESSED funciona', async () => {
     const w = await wallet();
     const t = await tx(w, { status: 'PENDING_REFERENCE', kind: 'REFUND', reference_external_transaction_id: 'x' });
@@ -262,16 +266,18 @@ describe('migrations reversíveis', () => {
     await admin.close();
   });
 
-  test('up -> 6 tabelas -> down -> só mikro_orm_migrations e sem funções -> up', async () => {
+  test('up -> 6 tabelas -> down x2 -> só mikro_orm_migrations e sem funções -> up', async () => {
     // 5 tabelas de domínio + a de controle do migrator
     const all = ['inbox_messages', 'outbox_messages', 'wager_transactions', 'wallet_ledger_entries', 'wallets', 'mikro_orm_migrations'].sort();
     const m = tmp.getMigrator();
     await m.up();
     expect(await tables()).toEqual(all);
+    // down desfaz uma migration por vez: são duas
+    await m.down();
     await m.down();
     expect(await tables()).toEqual(['mikro_orm_migrations']);
     const fns = await tmp.em.fork().execute(
-      `select proname from pg_proc where proname in ('ledger_immutable','wager_transactions_guard')`,
+      `select proname from pg_proc where proname in ('ledger_immutable','wager_transactions_guard','wager_transactions_no_truncate')`,
     );
     expect(fns).toHaveLength(0);
     await m.up();

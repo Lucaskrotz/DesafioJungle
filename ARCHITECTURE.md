@@ -161,7 +161,7 @@ O pool tem `min: 1`, `max: DB_POOL_MAX` (20 por padrão).
 
 ## d. Schema e invariantes no banco
 
-Migration única: `src/infrastructure/mikro-orm/migrations/Migration20261016000001_init.ts` (o `down` remove tabelas e funções em ordem inversa; testado em `schema-constraints.test.ts > migrations reversíveis`).
+Duas migrations: `Migration20261016000001_init.ts` (tabelas, constraints, triggers) e `Migration20261016000002_wager_transactions_no_truncate.ts` (trigger de `TRUNCATE` em `wager_transactions`). O `down` desfaz uma migration por vez; o da inicial remove tabelas e funções em ordem inversa. Testado em `schema-constraints.test.ts > migrations reversíveis`.
 
 ```mermaid
 erDiagram
@@ -206,7 +206,7 @@ erDiagram
 | `id uuid PRIMARY KEY` (= eventId), `seq bigserial UNIQUE` | `outbox_messages` | Evento único; ordem de inserção | `seq` ordena a publicação. |
 | `outbox_pending_idx (next_attempt_at, seq) WHERE published_at IS NULL` | `outbox_messages` | - | Claim barato só sobre pendentes. |
 
-O que o banco não garante sozinho: que `wallets.balance` seja igual à soma do ledger (garantido pelo código na mesma transação e verificado pela reconciliação), e que `version` só mude junto com o saldo (garantido pelo agregado). `wallets` não tem trigger de imutabilidade: o saldo precisa ser atualizável. Não há trigger de `TRUNCATE` em `wager_transactions`.
+O que o banco não garante sozinho: que `wallets.balance` seja igual à soma do ledger (garantido pelo código na mesma transação e verificado pela reconciliação), e que `version` só mude junto com o saldo (garantido pelo agregado). `wallets` não tem trigger de imutabilidade: o saldo precisa ser atualizável. `wager_transactions` também recusa `TRUNCATE` (trigger `wager_transactions_no_truncate`, statement, migration 2).
 
 ---
 
@@ -591,7 +591,7 @@ A seção 2 do desafio não pontua autenticação e recomenda não deixá-la com
 ### Pontos de extensão no código
 
 - `NoopAuthGuard` (`src/infrastructure/http/auth.ts`) registrado como `APP_GUARD` global em `src/app.module.ts`; hoje devolve `true`.
-- `ProviderIdentityPort` (`resolve(request): string | undefined`) e `NoopProviderIdentity` no mesmo arquivo, com o token `PROVIDER_IDENTITY`. A porta está definida mas ainda não está registrada no container nem consumida pelo guard.
+- `ProviderIdentityPort` (`resolve(request): string | undefined`) e `NoopProviderIdentity` no mesmo arquivo, com o token `PROVIDER_IDENTITY`. A porta está registrada em `AppModule` (`NoopProviderIdentity`) e injetada no `NoopAuthGuard`, que resolve a identidade e a ignora.
 
 ### Desenho com Keycloak (OIDC)
 
@@ -655,7 +655,7 @@ sequenceDiagram
 - **LocalStack não é SQS**: janela de deduplicação, entrega por grupo FIFO, `ApproximateReceiveCount` e tempo de redrive são aproximações. Os testes provam o comportamento do código, não do broker real.
 - **Logs síncronos**: o destino do pino é síncrono (para que a linha saia antes de um `process.exit` nos testes de crash); sob carga alta, escrita em stdout bloqueia o event loop.
 - **Reconciliação loga a diferença**: o log de divergência inclui o campo `difference` (valor monetário), que não está na lista de `redact`.
-- **Imagem Docker**: sem `.dockerignore`, `COPY . .` leva `node_modules` e `.env` do host. O container não roda migrations.
+- **Imagem Docker**: o `.dockerignore` exclui `node_modules`, `.env`, `.git`, `test` e `infra` do contexto. O container não roda migrations.
 - **Testes e dev compartilham o banco**: dados de teste se acumulam e `outbox.test.ts` marca como publicada toda a outbox pendente.
 - **Hash do inbox não normaliza Money**: o mesmo `messageId` reenviado com `"25"` em vez de `"25.00"` é tratado como mensagem inconsistente (DLQ), embora a transação seja a mesma.
 

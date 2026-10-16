@@ -5,7 +5,7 @@ import type { LoggerPort, MetricsPort, Observability, UnitOfWork } from './appli
 import { QueryService } from './application/queries';
 import { ReconcileWalletUseCase } from './application/reconcile-wallet';
 import { SubmitWagerTransactionUseCase } from './application/submit-wager-transaction';
-import { NoopAuthGuard } from './infrastructure/http/auth';
+import { NoopAuthGuard, NoopProviderIdentity, PROVIDER_IDENTITY } from './infrastructure/http/auth';
 import { AllExceptionsFilter } from './infrastructure/http/filters';
 import { HealthController } from './infrastructure/http/health.controller';
 import { WageringController } from './infrastructure/http/wagering.controller';
@@ -30,6 +30,7 @@ const useCase = <T>(provide: new (uow: UnitOfWork, obs: Observability) => T) => 
     useCase(SubmitWagerTransactionUseCase),
     useCase(ReconcileWalletUseCase),
     useCase(QueryService),
+    { provide: PROVIDER_IDENTITY, useClass: NoopProviderIdentity },
     // guard global no-op: /health/* e /metrics ficam abertos; um guard real deve isentar essas rotas
     { provide: APP_GUARD, useClass: NoopAuthGuard },
     { provide: APP_FILTER, useClass: AllExceptionsFilter },

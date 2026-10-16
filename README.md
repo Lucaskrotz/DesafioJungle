@@ -28,7 +28,7 @@ Portas usadas: `3000` (API), `5432` (Postgres), `4566` (LocalStack).
 bun install
 cp .env.example .env        # opcional: os defaults de src/config.ts são os mesmos valores
 bun run infra:up            # Postgres + LocalStack; espera os healthchecks (as filas são criadas no init do LocalStack)
-bun run migration:up        # aplica a migration inicial
+bun run migration:up        # aplica as migrations (2)
 bun run dev                 # API em http://localhost:3000, com consumidor SQS, publisher da outbox e worker de PENDING_REFERENCE
 ```
 
@@ -77,7 +77,7 @@ Lidas em `src/config.ts` (sob demanda, para que testes e processos filhos possam
 | `test:integration` | `bun test --timeout 60000 --max-concurrency 1 test/integration` | Postgres e LocalStack reais. |
 | `test:concurrency` | `bun test --timeout 120000 --max-concurrency 1 test/concurrency` | Paralelismo real e processos `bun src/main.ts` reais. |
 | `migration:up` | `bun src/infrastructure/mikro-orm/migrate.ts up` | Aplica migrations pendentes. |
-| `migration:down` | `bun src/infrastructure/mikro-orm/migrate.ts down` | Desfaz a última migration (hoje há uma só: remove tabelas e funções). |
+| `migration:down` | `bun src/infrastructure/mikro-orm/migrate.ts down` | Desfaz a última migration (há duas; rode duas vezes para desfazer tudo). |
 | `infra:up` | `docker compose up -d --wait postgres localstack` | Sobe Postgres e LocalStack e espera os healthchecks. |
 | `infra:down` | `docker compose down -v` | Remove containers e volumes. O Postgres não usa volume nomeado: os dados se perdem. |
 
@@ -116,7 +116,7 @@ docker compose --profile app logs -f app
 docker compose --profile app stop app && docker compose --profile app rm -f app
 ```
 
-Verificado: build em ~25 s, três réplicas `healthy` no `/health/ready`, e o cenário da seção 8 com cada aposta em uma réplica (wallet criada em `:3001`, BET de 80.00 em `:3000` e em `:3002` simultâneas) resultou em uma `PROCESSED`, uma `REJECTED INSUFFICIENT_FUNDS`, saldo `20.00`, `version` 2 e reconciliação consistente. Dentro da rede do compose as réplicas usam `postgres:5432` e `localstack:4566`. Pare o `bun run dev` antes (porta 3000). Não há `.dockerignore`: `COPY . .` leva `node_modules` e um eventual `.env` do host para a imagem.
+Verificado: build em ~25 s, três réplicas `healthy` no `/health/ready`, e o cenário da seção 8 com cada aposta em uma réplica (wallet criada em `:3001`, BET de 80.00 em `:3000` e em `:3002` simultâneas) resultou em uma `PROCESSED`, uma `REJECTED INSUFFICIENT_FUNDS`, saldo `20.00`, `version` 2 e reconciliação consistente. Dentro da rede do compose as réplicas usam `postgres:5432` e `localstack:4566`. Pare o `bun run dev` antes (porta 3000). O `.dockerignore` mantém `node_modules`, `.env`, `.git`, `test` e `infra` fora da imagem.
 
 ## Exemplos de API
 
@@ -376,7 +376,7 @@ A invariante final `wallet.balance == saldo reconstruído pelo ledger` está em 
 | Reinício com consistência final | `test/concurrency/phase6.test.ts` | `6. reinício com carga contínua (HTTP + SQS): SIGKILL de uma, de todas, retry total => consistência final` |
 | SIGTERM | `test/concurrency/phase6.test.ts`; `test/integration/sqs-consumer.test.ts` | `7. SIGTERM com mensagens em voo: sai com 0, nada perdido nem duplicado`; `consumidor SQS: graceful shutdown > ...` |
 | Invariante saldo == ledger | `test/support/invariants.ts` | `assertWalletConsistent`, chamado em 5 arquivos de teste |
-| Migrations e constraints | `test/integration/schema-constraints.test.ts` | CHECKs, UNIQUEs, FKs compostas, `wt_single_reversal_uq`, triggers, `migrations reversíveis > up -> 6 tabelas -> down -> ... -> up` |
+| Migrations e constraints | `test/integration/schema-constraints.test.ts` | CHECKs, UNIQUEs, FKs compostas, `wt_single_reversal_uq`, triggers, `migrations reversíveis > up -> 6 tabelas -> down x2 -> ... -> up` |
 | Atomicidade wallet/ledger/inbox/outbox | `test/integration/outbox.test.ts` | `BET grava eventos na mesma transação; falha depois do insert da outbox não deixa nada` |
 | Inbox e redelivery | `test/integration/sqs-consumer.test.ts` | `mesma mensagem 2x ...`; `mesmo externalTransactionId e key, messageId novo ...` |
 | Retry e DLQ | `test/integration/sqs-consumer.test.ts` | `erro transitório => visibilidade com backoff, sem delete; após maxReceiveCount vai à DLQ por redrive`; `JSON quebrado, schema inválido, OPENING e messageId reaproveitado com outro payload => DLQ explícita` |

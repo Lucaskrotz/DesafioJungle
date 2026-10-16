@@ -1,4 +1,4 @@
-import { Injectable, type CanActivate } from '@nestjs/common';
+import { Inject, Injectable, type CanActivate, type ExecutionContext } from '@nestjs/common';
 
 export const PROVIDER_IDENTITY = Symbol('PROVIDER_IDENTITY');
 
@@ -20,7 +20,11 @@ export class NoopProviderIdentity implements ProviderIdentityPort {
  */
 @Injectable()
 export class NoopAuthGuard implements CanActivate {
-  canActivate(): boolean {
+  constructor(@Inject(PROVIDER_IDENTITY) private readonly identity: ProviderIdentityPort) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // ponto de extensão: um guard real compara esta identidade com o providerId da requisição
+    this.identity.resolve(context.switchToHttp().getRequest());
     return true;
   }
 }
