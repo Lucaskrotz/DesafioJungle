@@ -6,8 +6,8 @@ import type { Orm } from './orm.config';
 import { buildRepos, pgCode } from './repositories';
 
 const MAX_ATTEMPTS = 3;
-// deadlock, serialization failure, lock timeout
-const RETRYABLE_CODES = new Set(['40P01', '40001', '55P03']);
+// SQLSTATE repetível -> motivo legível
+const RETRYABLE_CODES: Record<string, string> = { '40P01': 'deadlock', '40001': 'serialization_failure', '55P03': 'lock_timeout' };
 // conexão recusada/derrubada, banco reiniciando, sem slots
 const UNAVAILABLE_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', '57P01', '57P03', '53300']);
 
@@ -18,10 +18,19 @@ const isUnavailable = (e: unknown, code: string | undefined) =>
 
 const jitter = () => new Promise((r) => setTimeout(r, 20 + Math.random() * 60));
 
+/** `code` = SQLSTATE quando a causa é conflito de lock; `exhausted` = última tentativa (não haverá retry). */
+export interface RetryInfo {
+  reason: string;
+  code?: string;
+  attempt: number;
+  exhausted: boolean;
+}
+
 export class MikroOrmUnitOfWork implements UnitOfWork {
   constructor(
     private readonly orm: Orm,
-    private readonly onRetry?: (reason: string) => void,
+    /** Chamado a cada conflito repetível, inclusive o que esgota as tentativas. */
+    private readonly onRetry?: (info: RetryInfo) => void,
   ) {}
 
   async run<T>(fn: (repos: TxRepos) => Promise<T>): Promise<T> {
@@ -34,10 +43,12 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
       } catch (e) {
         const code = pgCode(e);
         if (isUnavailable(e, code)) throw new TransientInfrastructureError('Database unavailable', e);
-        const reason = e instanceof RetryableConflictError ? 'conflict' : code && RETRYABLE_CODES.has(code) ? code : undefined;
+        const lockCode = code !== undefined && Object.hasOwn(RETRYABLE_CODES, code) ? code : undefined;
+        const reason = e instanceof RetryableConflictError ? 'unique_conflict' : lockCode && RETRYABLE_CODES[lockCode];
         if (!reason) throw e; // domínio/aplicação/constraint de negócio: propaga inalterado
-        if (attempt >= MAX_ATTEMPTS) throw new TransientInfrastructureError(`Transaction retries exhausted (${reason})`, e);
-        this.onRetry?.(reason);
+        const exhausted = attempt >= MAX_ATTEMPTS;
+        this.onRetry?.({ reason, code: lockCode, attempt, exhausted });
+        if (exhausted) throw new TransientInfrastructureError(`Transaction retries exhausted (${reason})`, e);
         await jitter();
       }
     }

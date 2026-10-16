@@ -9,10 +9,12 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { IdempotencyConflictError, RetryableConflictError, TransientInfrastructureError } from '../../application/errors';
 import { newId } from '../../application/id';
+import { noopObservability, type MetricsPort } from '../../application/ports';
 import type { SubmitResult, SubmitWagerTransactionUseCase } from '../../application/submit-wager-transaction';
 import { canonicalJson } from '../../domain/payload-hash';
 import { loadConfig } from '../../config';
 import { idempotencyKeySchema, submitSchema } from '../http/schemas';
+import { errFields, logger } from '../observability/logger';
 import type { Sqs } from './sqs.client';
 
 export const CONSUMER_NAME = 'wager-transactions';
@@ -69,15 +71,15 @@ export interface WagerConsumerOptions {
   shutdownTimeoutMs?: number;
   /** Gancho de teste entre o commit e o DeleteMessage; se lançar, a mensagem NÃO é deletada. */
   beforeAck?: (ctx: AckContext) => Promise<void>;
+  metrics?: MetricsPort;
 }
 
 export type Outcome = 'processed' | 'duplicate' | 'business-error' | 'retry' | 'dead-lettered' | 'dlq-failed' | 'released' | 'ack-failed';
 
 type Fields = Record<string, unknown>;
 
-// TODO(fase 7): console JSON; a Fase 7 troca por pino
-const log = (level: 'info' | 'warn' | 'error', msg: string, fields: Fields = {}) =>
-  console.log(JSON.stringify({ time: new Date().toISOString(), level, logger: 'WagerConsumer', msg, ...fields }));
+const consumerLogger = logger.child({ component: 'WagerConsumer' });
+const log = (level: 'info' | 'warn' | 'error', msg: string, fields: Fields = {}) => consumerLogger[level](fields, msg);
 
 /**
  * Consumidor de wager-transactions.fifo. Correção garantida pelo banco (inbox + idempotência + lock da
@@ -85,6 +87,11 @@ const log = (level: 'info' | 'warn' | 'error', msg: string, fields: Fields = {})
  * Ack (DeleteMessage) só depois do commit: morrer entre os dois gera redelivery, que cai no inbox.
  */
 export class WagerConsumer {
+  /**
+   * Contadores locais (testes). Viram métrica: retries -> wager_retries_total{component="sqs_consumer"} e
+   * deadLettered -> wager_dlq_messages_total. duplicates/conflicts já são contados pelo caso de uso
+   * (wager_duplicates_total{source="sqs"}, wager_idempotency_conflicts_total): repetir aqui contaria em dobro.
+   */
   readonly counters = { processed: 0, duplicates: 0, conflicts: 0, retries: 0, deadLettered: 0 };
 
   private readonly queueName: string;
@@ -94,6 +101,7 @@ export class WagerConsumer {
   private readonly concurrency: number;
   private readonly shutdownTimeoutMs: number;
   private readonly beforeAck?: (ctx: AckContext) => Promise<void>;
+  private readonly metrics: MetricsPort;
 
   private stopping = false;
   private loop?: Promise<void>;
@@ -113,6 +121,7 @@ export class WagerConsumer {
     this.concurrency = Math.max(1, opts.concurrency ?? cfg.consumerConcurrency);
     this.shutdownTimeoutMs = opts.shutdownTimeoutMs ?? cfg.consumerShutdownTimeoutMs;
     this.beforeAck = opts.beforeAck;
+    this.metrics = opts.metrics ?? noopObservability.metrics;
   }
 
   start(): void {
@@ -123,7 +132,7 @@ export class WagerConsumer {
         try {
           await this.runOnce();
         } catch (e) {
-          log('error', 'receive cycle failed', { error: (e as Error).message });
+          log('error', 'receive cycle failed', errFields(e));
           await Bun.sleep(1_000);
         }
       }
@@ -257,7 +266,7 @@ export class WagerConsumer {
     try {
       await this.beforeAck?.(ctx);
     } catch (e) {
-      log('warn', 'ack aborted before delete', { ...fields, error: (e as Error).message });
+      log('warn', 'ack aborted before delete', { ...fields, ...errFields(e) });
       return 'ack-failed';
     }
     if (process.env.FAULT_EXIT_BEFORE_ACK === '1') process.exit(137); // injeção de falha: morre entre commit e ack
@@ -266,13 +275,14 @@ export class WagerConsumer {
       return outcome;
     } catch (e) {
       // não é erro de negócio: a redelivery cai no inbox e é acked como duplicata
-      log('warn', 'delete failed', { ...fields, error: (e as Error).message });
+      log('warn', 'delete failed', { ...fields, ...errFields(e) });
       return 'ack-failed';
     }
   }
 
   private async retry(queueUrl: string, m: Message, e: unknown, receiveCount: number, fields: Fields): Promise<Outcome> {
     this.counters.retries++;
+    this.metrics.retry('sqs_consumer', 'transient');
     const seconds = retryBackoffSeconds(receiveCount);
     log('warn', 'transient failure, retrying', { ...fields, errorName: (e as Error).name, retryInSeconds: seconds });
     try {
@@ -280,7 +290,7 @@ export class WagerConsumer {
         new ChangeMessageVisibilityCommand({ QueueUrl: queueUrl, ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: seconds }),
       );
     } catch (err) {
-      log('warn', 'change visibility failed', { ...fields, error: (err as Error).message });
+      log('warn', 'change visibility failed', { ...fields, ...errFields(err) });
     }
     return 'retry'; // após maxReceiveCount a redrive policy leva para a DLQ
   }
@@ -305,15 +315,16 @@ export class WagerConsumer {
       );
     } catch (err) {
       // sem delete: a redrive policy ainda leva a mensagem para a DLQ
-      log('error', 'dead-letter send failed', { ...fields, errorName, error: (err as Error).message });
+      log('error', 'dead-letter send failed', { ...fields, ...errFields(err), causeErrorName: errorName });
       return 'dlq-failed';
     }
     this.counters.deadLettered++;
+    this.metrics.dlqMessage();
     log('error', 'permanent failure, sent to DLQ', { ...fields, errorName });
     try {
       await this.sqs.client.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: m.ReceiptHandle }));
     } catch (err) {
-      log('warn', 'delete after DLQ failed', { ...fields, error: (err as Error).message });
+      log('warn', 'delete after DLQ failed', { ...fields, ...errFields(err) });
     }
     return 'dead-lettered';
   }
@@ -324,7 +335,7 @@ export class WagerConsumer {
         new ChangeMessageVisibilityCommand({ QueueUrl: queueUrl, ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: 0 }),
       );
     } catch (e) {
-      log('warn', 'release failed', { sqsMessageId: m.MessageId, error: (e as Error).message });
+      log('warn', 'release failed', { sqsMessageId: m.MessageId, ...errFields(e) });
     }
     return 'released';
   }

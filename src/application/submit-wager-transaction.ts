@@ -6,7 +6,7 @@ import { WagerTransaction, WagerTransactionKind } from '../domain/wager-transact
 import { InboxMessage } from '../domain/inbox-message';
 import { IdempotencyConflictError, InboxPayloadMismatchError } from './errors';
 import { newId } from './id';
-import type { TxRepos, UnitOfWork } from './ports';
+import { noopObservability, type EntrySource, type Observability, type TxRepos, type UnitOfWork } from './ports';
 import { applyWagerTransaction } from './wager-processor';
 
 export interface SubmitWagerCommand {
@@ -42,10 +42,51 @@ export interface SubmitResult {
 }
 
 export class SubmitWagerTransactionUseCase {
-  constructor(private readonly uow: UnitOfWork) {}
+  constructor(
+    private readonly uow: UnitOfWork,
+    private readonly obs: Observability = noopObservability,
+  ) {}
 
+  /** Métricas e log só depois do commit (o UoW pode repetir a função; contar dentro dela duplicaria). */
   async execute(cmd: SubmitWagerCommand, ctx: SubmitContext = {}): Promise<SubmitResult> {
     const correlationId = ctx.correlationId ?? newId();
+    const source: EntrySource = ctx.inbox ? 'sqs' : 'http';
+    const started = performance.now();
+    const fields = {
+      correlationId,
+      ...(ctx.messageId ? { messageId: ctx.messageId } : {}),
+      walletId: cmd.walletId,
+      providerId: cmd.providerId,
+      kind: cmd.kind,
+    };
+    const { logger, metrics } = this.obs;
+    let result: SubmitResult;
+    try {
+      result = await this.run(cmd, ctx, correlationId);
+    } catch (e) {
+      if (e instanceof IdempotencyConflictError) {
+        metrics.idempotencyConflict();
+        logger.warn(fields, 'idempotency conflict');
+      }
+      throw e;
+    } finally {
+      metrics.processingDuration(source, (performance.now() - started) / 1000);
+    }
+
+    const out = { ...fields, transactionId: result.transactionId, status: result.status, failureCode: result.failureCode };
+    if (result.idempotentReplay) {
+      metrics.duplicate(source);
+      // duplicata de inbox já é logada pelo consumidor
+      if (!result.duplicateMessage) logger.info(out, 'idempotent replay');
+    } else {
+      metrics.transactionRecorded(result.status, cmd.kind, result.failureCode);
+      if (result.status === 'REJECTED') logger.warn(out, 'wager transaction rejected');
+      else logger.info(out, 'wager transaction recorded');
+    }
+    return result;
+  }
+
+  private async run(cmd: SubmitWagerCommand, ctx: SubmitContext, correlationId: string): Promise<SubmitResult> {
     const id = newId();
     const payloadHash = hashOf(cmd);
     // Validação pura antes de tocar o banco (lança InvalidMoneyError / InvalidWagerTransactionError => 400)

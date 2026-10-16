@@ -5,7 +5,7 @@ import { computePayloadHash } from '../domain/payload-hash';
 import { WagerTransaction } from '../domain/wager-transaction';
 import { Wallet } from '../domain/wallet';
 import { newId } from './id';
-import type { UnitOfWork } from './ports';
+import { noopObservability, type Observability, type UnitOfWork } from './ports';
 
 export interface OpenWalletCommand {
   playerId: string;
@@ -24,7 +24,10 @@ export function toWalletView(w: Wallet): WalletView {
 }
 
 export class OpenWalletUseCase {
-  constructor(private readonly uow: UnitOfWork) {}
+  constructor(
+    private readonly uow: UnitOfWork,
+    private readonly obs: Observability = noopObservability,
+  ) {}
 
   async execute(cmd: OpenWalletCommand, correlationId: string = newId()): Promise<WalletView> {
     const initialBalance = Money.from(cmd.initialBalance);
@@ -59,6 +62,7 @@ export class OpenWalletUseCase {
       await r.outbox.add(OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, entry, ctx())));
     });
 
+    this.obs.logger.info({ correlationId, walletId }, 'wallet opened');
     return toWalletView(wallet);
   }
 }

@@ -1,4 +1,5 @@
-import type { Logger } from '@nestjs/common';
+import type { LoggerPort } from '../../application/ports';
+import { errFields } from '../observability/logger';
 
 /** Loop com setTimeout encadeado: nunca sobrepõe ciclos; stop() espera o ciclo em andamento. */
 export class PollLoop {
@@ -9,7 +10,7 @@ export class PollLoop {
   constructor(
     private readonly tick: () => Promise<unknown>,
     private readonly intervalMs: number,
-    private readonly logger: Logger,
+    private readonly logger: LoggerPort,
   ) {}
 
   start(): void {
@@ -29,7 +30,7 @@ export class PollLoop {
       this.current = this.tick()
         .then(
           () => undefined,
-          (e) => this.logger.error(e instanceof Error ? (e.stack ?? e.message) : String(e)),
+          (e) => this.logger.error(errFields(e), 'poll cycle failed'),
         )
         .finally(() => {
           if (this.running) this.schedule(this.intervalMs);

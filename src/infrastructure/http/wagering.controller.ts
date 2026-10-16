@@ -3,6 +3,7 @@ import { Body, Controller, Get, Headers, Inject, Param, Post, Res } from '@nestj
 type Response = { status(code: number): Response; setHeader(k: string, v: string): unknown; json(body: unknown): unknown };
 import { QueryService } from '../../application/queries';
 import { SubmitWagerTransactionUseCase } from '../../application/submit-wager-transaction';
+import { CorrelationId } from './observability';
 import { idempotencyKeySchema, parse, submitSchema, uuidSchema } from './schemas';
 
 const STATUS_HTTP = { PROCESSED: 200, PENDING_REFERENCE: 202, REJECTED: 422, FAILED: 500 } as const;
@@ -15,9 +16,14 @@ export class WageringController {
   ) {}
 
   @Post('wagering/transactions')
-  async create(@Body() body: unknown, @Headers('idempotency-key') key: unknown, @Res({ passthrough: true }) res: Response) {
+  async create(
+    @Body() body: unknown,
+    @Headers('idempotency-key') key: unknown,
+    @CorrelationId() correlationId: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
     const idempotencyKey = parse(idempotencyKeySchema, key);
-    const result = await this.submit.execute({ ...parse(submitSchema, body), idempotencyKey });
+    const result = await this.submit.execute({ ...parse(submitSchema, body), idempotencyKey }, { correlationId });
     res.status(STATUS_HTTP[result.status]);
     return result;
   }

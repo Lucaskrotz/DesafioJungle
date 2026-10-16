@@ -1,4 +1,4 @@
-import { Catch, HttpException, Logger, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common';
+import { Catch, HttpException, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common';
 // Sem @types/express: tipo mínimo do que usamos da resposta.
 type Response = { status(code: number): Response; setHeader(k: string, v: string): unknown; json(body: unknown): unknown };
 import { ZodError } from 'zod';
@@ -10,8 +10,7 @@ import {
   WalletAlreadyExistsError,
 } from '../../application/errors';
 import { InvalidMoneyError, InvalidWagerTransactionError } from '../../domain/errors';
-
-const logger = new Logger('HttpExceptionFilter');
+import { errFields, logger } from '../observability/logger';
 
 interface ErrorBody {
   error: string;
@@ -40,7 +39,6 @@ function map(e: unknown): { status: number; body: ErrorBody | object; headers?: 
     const error = status === 400 ? 'INVALID_PAYLOAD' : status === 404 ? 'NOT_FOUND' : `HTTP_${status}`;
     return { status, body: { error, message: e.message } };
   }
-  logger.error(e instanceof Error ? (e.stack ?? e.message) : String(e));
   return { status: 500, body: { error: 'INTERNAL_ERROR', message: 'Internal server error' } };
 }
 
@@ -48,6 +46,9 @@ function map(e: unknown): { status: number; body: ErrorBody | object; headers?: 
 export class AllExceptionsFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost) {
     const { status, body, headers } = map(exception);
+    const correlationId = host.switchToHttp().getRequest<{ correlationId?: string }>().correlationId;
+    if (status >= 500 && status !== 503) logger.error({ correlationId, ...errFields(exception) }, 'unhandled error');
+    else if (exception instanceof TransientInfrastructureError) logger.warn({ correlationId, ...errFields(exception) }, 'transient failure');
     const res = host.switchToHttp().getResponse<Response>();
     for (const [k, v] of Object.entries(headers ?? {})) res.setHeader(k, v);
     res.status(status).json(body);

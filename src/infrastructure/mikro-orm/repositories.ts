@@ -155,7 +155,45 @@ class MikroOrmLedgerRepository implements LedgerRepository {
     );
     return rows.map((r) => ({ entry: ledgerEntryFromRow(r), seq: String(r.seq) }));
   }
+
+  async reconciliationSnapshot(walletId: string) {
+    // um único statement = um único snapshot (mesmo em READ COMMITTED), sem FOR UPDATE; soma em NUMERIC
+    const [row] = (await this.em.execute(RECONCILIATION_SQL, [walletId, walletId])) as {
+      stored: string;
+      currency: string;
+      credits: string;
+      debits: string;
+      entries: number;
+      breaks: number;
+    }[];
+    if (!row) return undefined;
+    return {
+      storedBalance: row.stored,
+      currency: row.currency,
+      credits: row.credits,
+      debits: row.debits,
+      entries: Number(row.entries),
+      chainBreaks: Number(row.breaks),
+    };
+  }
 }
+
+const RECONCILIATION_SQL = `
+  WITH e AS (
+    SELECT direction, amount, balance_before,
+           lag(balance_after, 1, 0::numeric) OVER (ORDER BY seq) AS prev_after
+      FROM wallet_ledger_entries
+     WHERE wallet_id = ?
+  )
+  SELECT w.balance::text AS stored, w.currency,
+         COALESCE(sum(e.amount) FILTER (WHERE e.direction = 'CREDIT'), 0)::text AS credits,
+         COALESCE(sum(e.amount) FILTER (WHERE e.direction = 'DEBIT'), 0)::text AS debits,
+         count(e.direction)::int AS entries,
+         count(*) FILTER (WHERE e.balance_before <> e.prev_after)::int AS breaks
+    FROM wallets w
+    LEFT JOIN e ON true
+   WHERE w.id = ?
+   GROUP BY w.balance, w.currency`;
 
 class MikroOrmOutboxRepository implements OutboxRepository {
   constructor(private readonly em: EntityManager) {}

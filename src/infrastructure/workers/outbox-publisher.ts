@@ -1,7 +1,8 @@
 import { SendMessageCommand } from '@aws-sdk/client-sqs';
-import { Logger } from '@nestjs/common';
 import type { EntityManager } from '@mikro-orm/postgresql';
+import { noopObservability, type MetricsPort } from '../../application/ports';
 import { loadConfig } from '../../config';
+import { errFields, logger } from '../observability/logger';
 import type { OutboxMessage } from '../../domain/outbox-message';
 import { outboxFromRow } from '../mikro-orm/mappers';
 import type { Orm } from '../mikro-orm/orm.config';
@@ -13,6 +14,7 @@ export interface OutboxPublisherOptions {
   queueName?: string;
   batchSize?: number;
   intervalMs?: number;
+  metrics?: MetricsPort;
 }
 
 // Pendentes e vencidas; SKIP LOCKED reparte o trabalho entre publishers sem lock global.
@@ -25,6 +27,17 @@ const CLAIM_SQL = `
    LIMIT ?
    FOR UPDATE SKIP LOCKED`;
 
+/** Pendentes e idade (s) do mais antigo; usado pelo publisher e pelo scrape de /metrics (mesmo sem workers). */
+export async function outboxBacklog(orm: Orm): Promise<{ pending: number; ageSeconds: number }> {
+  const [row] = (await orm.em
+    .fork()
+    .execute(
+      `SELECT count(*)::int AS pending, EXTRACT(EPOCH FROM now() - min(occurred_at)) AS age
+         FROM outbox_messages WHERE published_at IS NULL`,
+    )) as { pending: number; age: string | number | null }[];
+  return { pending: Number(row?.pending ?? 0), ageSeconds: row?.age == null ? 0 : Math.max(0, Number(row.age)) };
+}
+
 /**
  * Publica a outbox no SQS (at-least-once).
  * - Commit feito e processo morre antes de publicar: a linha segue pendente e qualquer instância a publica.
@@ -34,10 +47,11 @@ const CLAIM_SQL = `
  * pequeno e lock_timeout; a alternativa sem transação longa é claim por lease (locked_until) + marcação depois.
  */
 export class OutboxPublisher {
-  private readonly logger = new Logger(OutboxPublisher.name);
+  private readonly logger = logger.child({ component: 'OutboxPublisher' });
   private readonly loop: PollLoop;
   private readonly queueName: string;
   private readonly batchSize: number;
+  private readonly metrics: MetricsPort;
 
   constructor(
     private readonly orm: Orm,
@@ -46,6 +60,7 @@ export class OutboxPublisher {
   ) {
     this.queueName = opts.queueName ?? loadConfig().eventsQueue;
     this.batchSize = opts.batchSize ?? 25;
+    this.metrics = opts.metrics ?? noopObservability.metrics;
     this.loop = new PollLoop(() => this.runOnce(), opts.intervalMs ?? 500, this.logger);
   }
 
@@ -59,7 +74,7 @@ export class OutboxPublisher {
 
   /** `now` opcional só para testes; por padrão o vencimento usa o relógio do banco. */
   async runOnce(now?: Date): Promise<{ published: number; failed: number }> {
-    return this.orm.em.fork().transactional(async (em: EntityManager) => {
+    const result = await this.orm.em.fork().transactional(async (em: EntityManager) => {
       await em.execute(`SET LOCAL lock_timeout = '3s'`);
       const rows = (await em.execute(CLAIM_SQL, [now ?? null, this.batchSize])) as OutboxMessageRow[];
       let published = 0;
@@ -78,7 +93,10 @@ export class OutboxPublisher {
             m.id,
           ]);
           failed++;
-          this.logger.warn(`outbox publish failed eventId=${m.id} attempts=${m.attempts}: ${(e as Error).message}`);
+          // o envio falhou de fato (com ou sem commit do reagendamento, a linha será tentada de novo)
+          this.metrics.outboxPublishFailed(1);
+          this.metrics.retry('outbox_publisher', 'publish_failed');
+          this.logger.warn({ eventId: m.id, eventType: m.eventType, attempts: m.attempts, ...errFields(e) }, 'outbox publish failed');
           continue;
         }
         m.markPublished(now ?? new Date());
@@ -87,16 +105,14 @@ export class OutboxPublisher {
       }
       return { published, failed };
     });
+    // contado após o commit da marcação (rollback => nada foi "publicado" do ponto de vista da outbox)
+    if (result.published) this.metrics.outboxPublished(result.published);
+    return result;
   }
 
   /** Idade (s) do evento pendente mais antigo: métrica de lag da outbox. */
   async oldestPendingAgeSeconds(): Promise<number> {
-    const [row] = (await this.orm.em
-      .fork()
-      .execute(`SELECT EXTRACT(EPOCH FROM now() - min(occurred_at)) AS age FROM outbox_messages WHERE published_at IS NULL`)) as {
-      age: string | number | null;
-    }[];
-    return row?.age == null ? 0 : Math.max(0, Number(row.age));
+    return (await outboxBacklog(this.orm)).ageSeconds;
   }
 
   private async send(m: OutboxMessage): Promise<void> {
