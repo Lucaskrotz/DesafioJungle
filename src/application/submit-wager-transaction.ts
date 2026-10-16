@@ -3,7 +3,8 @@ import { FailureCode } from '../domain/failure-code';
 import { Money, MoneyProps } from '../domain/money';
 import { computePayloadHash } from '../domain/payload-hash';
 import { WagerTransaction, WagerTransactionKind } from '../domain/wager-transaction';
-import { IdempotencyConflictError } from './errors';
+import { InboxMessage } from '../domain/inbox-message';
+import { IdempotencyConflictError, InboxPayloadMismatchError } from './errors';
 import { newId } from './id';
 import type { TxRepos, UnitOfWork } from './ports';
 import { applyWagerTransaction } from './wager-processor';
@@ -25,6 +26,8 @@ export interface SubmitWagerCommand {
 export interface SubmitContext {
   correlationId?: string;
   messageId?: string;
+  /** Entrada via fila: deduplicação persistente na MESMA transação do efeito financeiro. */
+  inbox?: { consumerName: string; messageId: string; payloadHash: string };
 }
 
 export interface SubmitResult {
@@ -34,6 +37,8 @@ export interface SubmitResult {
   failureCode?: FailureCode;
   balance?: MoneyProps;
   idempotentReplay: boolean;
+  /** Só na entrada via fila: a mensagem já tinha sido processada; nada foi feito. */
+  duplicateMessage?: true;
 }
 
 export class SubmitWagerTransactionUseCase {
@@ -47,7 +52,7 @@ export class SubmitWagerTransactionUseCase {
     const build = () => buildTransaction(id, cmd, payloadHash);
     build();
 
-    return this.uow.run(async (r) => {
+    const handle = async (r: TxRepos): Promise<SubmitResult> => {
       const wallet = await r.wallets.findByIdForUpdate(cmd.walletId);
       if (!wallet) return unpersisted(FailureCode.WalletNotFound);
 
@@ -65,6 +70,26 @@ export class SubmitWagerTransactionUseCase {
       const tx = build(); // instância nova a cada tentativa (o UoW pode repetir a função)
       await applyWagerTransaction(r, wallet, tx, 'insert', { correlationId, causationId: ctx.messageId });
       return toResult(tx, false);
+    };
+
+    const inbox = ctx.inbox;
+    if (!inbox) return this.uow.run(handle);
+
+    return this.uow.run(async (r) => {
+      // inbox antes de qualquer lock: duplicata não toca na wallet; exceção => rollback e o inbox some junto
+      const received = await r.inbox.tryReceive(InboxMessage.receive({ ...inbox, receivedAt: new Date() }));
+      if (!received) {
+        const stored = await r.inbox.find(inbox.consumerName, inbox.messageId);
+        if (stored?.payloadHash !== inbox.payloadHash) {
+          throw new InboxPayloadMismatchError(`Message ${inbox.messageId} already received with a different payload`);
+        }
+        const existing = await r.transactions.findForIdempotency(cmd.idempotencyKey, cmd.providerId, cmd.externalTransactionId);
+        // sem transação persistida (ex.: wallet inexistente) não há resultado a repetir
+        return { ...(existing ? toResult(existing, true) : { status: 'REJECTED' as const, idempotentReplay: true }), duplicateMessage: true };
+      }
+      const result = await handle(r);
+      await r.inbox.markProcessed(inbox.consumerName, inbox.messageId, new Date());
+      return result;
     });
   }
 }

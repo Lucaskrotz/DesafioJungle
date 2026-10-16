@@ -1,3 +1,4 @@
+import type { InboxMessage } from '../domain/inbox-message';
 import type { OutboxMessage } from '../domain/outbox-message';
 import type { WagerTransaction } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
@@ -39,11 +40,19 @@ export interface OutboxRepository {
   add(message: OutboxMessage): Promise<void>;
 }
 
+export interface InboxRepository {
+  /** INSERT ... ON CONFLICT (consumer_name, message_id) DO NOTHING: true se inseriu, false se já existia. */
+  tryReceive(msg: InboxMessage): Promise<boolean>;
+  find(consumerName: string, messageId: string): Promise<InboxMessage | undefined>;
+  markProcessed(consumerName: string, messageId: string, at: Date): Promise<void>;
+}
+
 export interface TxRepos {
   wallets: WalletRepository;
   transactions: TransactionRepository;
   ledger: LedgerRepository;
   outbox: OutboxRepository;
+  inbox: InboxRepository;
 }
 
 export interface UnitOfWork {

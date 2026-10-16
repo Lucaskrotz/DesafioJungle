@@ -9,6 +9,9 @@ export abstract class ApplicationError extends Error {
 /** Mesma idempotency key (ou mesmo externalTransactionId) com payload/key diferente. */
 export class IdempotencyConflictError extends ApplicationError {}
 
+/** Mesmo messageId já recebido com outro conteúdo: mensagem inconsistente (erro permanente). */
+export class InboxPayloadMismatchError extends ApplicationError {}
+
 export class WalletAlreadyExistsError extends ApplicationError {}
 
 export class NotFoundError extends ApplicationError {}

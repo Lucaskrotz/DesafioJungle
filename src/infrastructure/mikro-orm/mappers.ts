@@ -8,7 +8,8 @@ import {
 } from '../../domain/wager-transaction';
 import { Wallet } from '../../domain/wallet';
 import { type LedgerDirection, WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
-import type { LedgerEntryRow, OutboxMessageRow, WagerTransactionRow, WalletRow } from './schemas';
+import { InboxMessage } from '../../domain/inbox-message';
+import type { InboxMessageRow, LedgerEntryRow, OutboxMessageRow, WagerTransactionRow, WalletRow } from './schemas';
 
 /** Mapeamento explícito domínio <-> linha. Dinheiro trafega sempre como string numeric(20,2). */
 
@@ -113,7 +114,16 @@ export const ledgerEntryFromRow = (r: LedgerEntryRow): WalletLedgerEntry =>
     createdAt: r.createdAt,
   });
 
-export const outboxToRow = (m: OutboxMessage): Omit<OutboxMessageRow, 'seq'> => ({
+export const inboxFromRow = (r: InboxMessageRow): InboxMessage =>
+  InboxMessage.rehydrate({
+    consumerName: r.consumerName,
+    messageId: r.messageId,
+    payloadHash: r.payloadHash,
+    receivedAt: r.receivedAt,
+    processedAt: opt(r.processedAt),
+  });
+
+export const outboxToRow =(m: OutboxMessage): Omit<OutboxMessageRow, 'seq'> => ({
   id: m.id,
   aggregateId: m.aggregateId,
   eventType: m.eventType,

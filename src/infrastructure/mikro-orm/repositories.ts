@@ -2,17 +2,20 @@ import { LockMode } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import { RetryableConflictError, WalletAlreadyExistsError } from '../../application/errors';
 import type {
+  InboxRepository,
   LedgerRepository,
   OutboxRepository,
   TransactionRepository,
   TxRepos,
   WalletRepository,
 } from '../../application/ports';
+import type { InboxMessage } from '../../domain/inbox-message';
 import type { OutboxMessage } from '../../domain/outbox-message';
 import type { WagerTransaction } from '../../domain/wager-transaction';
 import type { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
 import {
+  inboxFromRow,
   ledgerEntryFromRow,
   ledgerEntryToRow,
   outboxToRow,
@@ -21,7 +24,7 @@ import {
   walletFromRow,
   walletToRow,
 } from './mappers';
-import { LedgerEntrySchema, OutboxMessageSchema, WagerTransactionSchema, WalletSchema } from './schemas';
+import { InboxMessageSchema, LedgerEntrySchema, OutboxMessageSchema, WagerTransactionSchema, WalletSchema } from './schemas';
 
 // Leituras sempre do banco (o identity map não enxerga as escritas nativas). Mantém a transação corrente.
 const FRESH = { disableIdentityMap: true } as const;
@@ -162,11 +165,36 @@ class MikroOrmOutboxRepository implements OutboxRepository {
   }
 }
 
+class MikroOrmInboxRepository implements InboxRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async tryReceive(m: InboxMessage) {
+    // concorrente com a mesma chave espera o commit/rollback do outro e então decide
+    const rows = (await this.em.execute(
+      `INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at, processed_at)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT (consumer_name, message_id) DO NOTHING RETURNING 1`,
+      [m.consumerName, m.messageId, m.payloadHash, m.receivedAt, m.processedAt ?? null],
+    )) as unknown[];
+    return rows.length === 1;
+  }
+
+  async find(consumerName: string, messageId: string) {
+    const row = await this.em.findOne(InboxMessageSchema, { consumerName, messageId }, FRESH);
+    return row ? inboxFromRow(row) : undefined;
+  }
+
+  async markProcessed(consumerName: string, messageId: string, at: Date) {
+    const affected = await this.em.nativeUpdate(InboxMessageSchema, { consumerName, messageId }, { processedAt: at });
+    if (affected !== 1) throw new Error(`Inbox message ${consumerName}/${messageId} not found`);
+  }
+}
+
 export function buildRepos(em: EntityManager): TxRepos {
   return {
     wallets: new MikroOrmWalletRepository(em),
     transactions: new MikroOrmTransactionRepository(em),
     ledger: new MikroOrmLedgerRepository(em),
     outbox: new MikroOrmOutboxRepository(em),
+    inbox: new MikroOrmInboxRepository(em),
   };
 }
