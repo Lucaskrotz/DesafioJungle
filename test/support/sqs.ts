@@ -3,9 +3,12 @@ import {
   DeleteQueueCommand,
   GetQueueAttributesCommand,
   ReceiveMessageCommand,
+  SendMessageBatchCommand,
   SendMessageCommand,
   type Message,
 } from '@aws-sdk/client-sqs';
+import { expect } from 'bun:test';
+import type { SubmitWagerCommand } from '../../src/application/submit-wager-transaction';
 import type { Sqs } from '../../src/infrastructure/sqs/sqs.client';
 
 export type Queues = { name: string; dlqName: string; url: string; dlqUrl: string; urls: string[] };
@@ -52,6 +55,47 @@ export const sendMessage = (sqs: Sqs, url: string, body: unknown, groupId: strin
       MessageDeduplicationId: crypto.randomUUID(),
     }),
   );
+
+export type Msg = { messageId: string; type: 'WagerTransactionRequested'; occurredAt: string; data: SubmitWagerCommand };
+export const toMessage = (data: SubmitWagerCommand, messageId: string = crypto.randomUUID()): Msg => ({
+  messageId,
+  type: 'WagerTransactionRequested',
+  occurredAt: new Date().toISOString(),
+  data,
+});
+
+/** Envia em lotes de 10; dedup id sempre novo (reenvio de um mesmo messageId chega de fato duplicado). */
+export async function sendBatch(sqs: Sqs, url: string, items: { body: Msg; group: string }[]) {
+  for (let i = 0; i < items.length; i += 10) {
+    const Entries = items.slice(i, i + 10).map((it, j) => ({
+      Id: String(j),
+      MessageBody: JSON.stringify(it.body),
+      MessageGroupId: it.group,
+      MessageDeduplicationId: crypto.randomUUID(),
+    }));
+    const r = await sqs.client.send(new SendMessageBatchCommand({ QueueUrl: url, Entries }));
+    expect(r.Failed ?? []).toHaveLength(0);
+  }
+}
+
+export type ScenarioQueues = { qs: Queues; events: { name: string; url: string } };
+/** Fila principal (com DLQ) + fila de eventos temporárias; apagadas no fim, inclusive em falha. */
+export async function withQueues<T>(sqs: Sqs, opts: { visibility?: number; maxReceiveCount?: number }, fn: (q: ScenarioQueues) => Promise<T>) {
+  const qs = await tempQueues(sqs, { visibility: opts.visibility ?? 3, maxReceiveCount: opts.maxReceiveCount ?? 5 });
+  const events = await tempFifo(sqs, 'we');
+  try {
+    return await fn({ qs, events });
+  } finally {
+    await deleteQueues(sqs, [...qs.urls, events.url]);
+  }
+}
+
+/** Ambiente de uma instância apontando para as filas temporárias. */
+export const queueEnv = ({ qs, events }: ScenarioQueues): Record<string, string> => ({
+  SQS_TRANSACTIONS_QUEUE: qs.name,
+  SQS_TRANSACTIONS_DLQ: qs.dlqName,
+  SQS_EVENTS_QUEUE: events.name,
+});
 
 export async function queueCounts(sqs: Sqs, url: string) {
   const a = (

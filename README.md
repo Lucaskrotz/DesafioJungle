@@ -76,8 +76,9 @@ Lidas em `src/config.ts` (sob demanda, para que testes e processos filhos possam
 | `test:unit` | `bun test test/unit` | Domínio, classificação de erros, logger, reconciliação com snapshot simulado. Não precisa de containers. |
 | `test:integration` | `bun test --timeout 60000 --max-concurrency 1 test/integration` | Postgres e LocalStack reais. |
 | `test:concurrency` | `bun test --timeout 120000 --max-concurrency 1 test/concurrency` | Paralelismo real e processos `bun src/main.ts` reais. |
+| `test:load` | `bun test/load/load-test.ts` | Teste de carga sob demanda (fora de `test`). Ver [Teste de carga](#teste-de-carga). |
 | `migration:up` | `bun src/infrastructure/mikro-orm/migrate.ts up` | Aplica migrations pendentes. |
-| `migration:down` | `bun src/infrastructure/mikro-orm/migrate.ts down` | Desfaz a última migration (há duas; rode duas vezes para desfazer tudo). |
+| `migration:down` | `bun src/infrastructure/mikro-orm/migrate.ts down` | Desfaz a última migration (há três; rode três vezes para desfazer tudo). |
 | `infra:up` | `docker compose up -d --wait postgres localstack` | Sobe Postgres e LocalStack e espera os healthchecks. |
 | `infra:down` | `docker compose down -v` | Remove containers e volumes. O Postgres não usa volume nomeado: os dados se perdem. |
 
@@ -88,10 +89,10 @@ Medido em WSL2 (Ubuntu 24.04) + Docker Desktop, Bun 1.4, containers já de pé e
 | Suíte | Exige | Arquivos / testes | Tempo |
 |---|---|---|---|
 | `typecheck` | nada | - | ~6,5 s |
-| `test:unit` | nada | 6 / 82 | ~0,1 s |
-| `test:integration` | Postgres migrado + LocalStack com as filas do init | 7 / 77 | ~35 s |
+| `test:unit` | nada | 7 / 84 | ~0,5 s |
+| `test:integration` | Postgres migrado + LocalStack com as filas do init | 7 / 79 | ~38 s |
 | `test:concurrency` | Postgres migrado + LocalStack + `bun` no `PATH` (sobe até 4 processos por cenário, em portas livres) | 2 / 44 | ~44 s |
-| `test` | tudo acima | 15 / 203 | ~76 s |
+| `test` | tudo acima (não inclui `test:load`) | 16 / 207 | ~80 s |
 
 Observações:
 
@@ -99,6 +100,32 @@ Observações:
 - O teste de migrations cria e remove um banco temporário `wager_migration_test`.
 - Pare o `bun run dev` antes de rodar os testes: os workers dele publicariam a mesma outbox e disputariam a fila `wager-events.fifo` com `outbox.test.ts`.
 - Os testes SQS criam filas FIFO temporárias (com DLQ e redrive próprios) e as apagam no fim.
+
+## Teste de carga
+
+```bash
+bun run infra:up && bun run migration:up   # se ainda não estiverem de pé
+bun run test:load                          # todos os cenários, 1 e 3 instâncias, ~5 min
+env SCENARIOS=A INSTANCES=3 CONCURRENCY=64 DURATION_S=30 bun run test:load
+bun run test:load --repeat=2 --drain-timeout-s=120   # flags equivalem às variáveis (--duration-s=30 -> DURATION_S=30)
+```
+
+Sobe instâncias reais (`bun src/main.ts`, workers ligados, filas SQS temporárias próprias), gera carga em laço fechado com round-robin entre elas e, ao fim de cada cenário, verifica as invariantes no banco; se alguma falhar, sai com código 1. Imprime uma linha por execução e grava o JSON completo em `load-results/` (ignorado no git). Cenários: `A` (500 wallets, mix BET/WIN/LOSS/REFUND + 5% de replays), `B` (hot wallet com saldo alto), `B_LOW` (hot wallet com saldo baixo: INSUFFICIENT_FUNDS sob contenção), `C` (drenagem de mensagens SQS).
+
+| Variável | Default | Significado |
+|---|---|---|
+| `SCENARIOS` | `A,B,B_LOW,C` | Cenários a rodar. |
+| `INSTANCES` | `1,3` | Quantidades de instâncias; cada cenário roda com cada uma. |
+| `REPEAT` | `1` | Execuções por combinação. |
+| `DURATION_S` / `WARMUP_S` | `15` / `3` | Janela medida e aquecimento descartado. |
+| `CONCURRENCY` | `32` | Workers virtuais (requisições em voo). |
+| `WALLETS` / `REPLAY_PCT` | `500` / `5` | Cenário A. |
+| `LOW_BALANCE` | `100` | Saldo da hot wallet em `B_LOW` (BETs de 1.00). |
+| `SQS_MESSAGES` / `SQS_WALLETS` | `2000` / `100` | Cenário C. |
+| `DRAIN_TIMEOUT_S` | `60` | Espera máxima pela outbox zerar após a carga. |
+| `DB_POOL_MAX` | `10` | Pool por instância (o default da aplicação é 20). |
+
+Metodologia, resultados medidos e análise: [LOAD_TEST.md](LOAD_TEST.md).
 
 ## Réplicas via Docker Compose
 
@@ -350,7 +377,7 @@ infra/localstack-init.sh   cria as filas e a redrive policy
 
 ## Testes
 
-203 testes (82 unidade, 77 integração, 44 concorrência). Nenhum substitui Postgres ou SQS por mock: os testes de integração e concorrência rodam contra os containers. Falhas são injetadas em pontos específicos (um `UnitOfWork` que lança erro transitório, um 40P01 artificial, uma subclasse do publisher que "morre" antes de marcar, o gancho `beforeAck` e `FAULT_EXIT_BEFORE_ACK`), sempre com fila, banco e caso de uso reais.
+207 testes (84 unidade, 79 integração, 44 concorrência), mais o teste de carga sob demanda (`bun run test:load`, [LOAD_TEST.md](LOAD_TEST.md)). Nenhum substitui Postgres ou SQS por mock: os testes de integração e concorrência rodam contra os containers. Falhas são injetadas em pontos específicos (um `UnitOfWork` que lança erro transitório, um 40P01 artificial, uma subclasse do publisher que "morre" antes de marcar, o gancho `beforeAck` e `FAULT_EXIT_BEFORE_ACK`), sempre com fila, banco e caso de uso reais.
 
 A invariante final `wallet.balance == saldo reconstruído pelo ledger` está em `test/support/invariants.ts` (`assertWalletConsistent`): saldo não negativo, um lançamento por transação, cadeia `balance_before`/`balance_after` contínua a partir de 0, soma CREDIT - DEBIT igual ao saldo e `version == 1 + lançamentos após a OPENING`. É chamada nos testes de concorrência, de PENDING_REFERENCE, do consumidor SQS e de reconciliação.
 
@@ -376,7 +403,7 @@ A invariante final `wallet.balance == saldo reconstruído pelo ledger` está em 
 | Reinício com consistência final | `test/concurrency/phase6.test.ts` | `6. reinício com carga contínua (HTTP + SQS): SIGKILL de uma, de todas, retry total => consistência final` |
 | SIGTERM | `test/concurrency/phase6.test.ts`; `test/integration/sqs-consumer.test.ts` | `7. SIGTERM com mensagens em voo: sai com 0, nada perdido nem duplicado`; `consumidor SQS: graceful shutdown > ...` |
 | Invariante saldo == ledger | `test/support/invariants.ts` | `assertWalletConsistent`, chamado em 5 arquivos de teste |
-| Migrations e constraints | `test/integration/schema-constraints.test.ts` | CHECKs, UNIQUEs, FKs compostas, `wt_single_reversal_uq`, triggers, `migrations reversíveis > up -> 6 tabelas -> down x2 -> ... -> up` |
+| Migrations e constraints | `test/integration/schema-constraints.test.ts` | CHECKs, UNIQUEs, FKs compostas, `wt_single_reversal_uq`, triggers, `migrations reversíveis > up -> 6 tabelas -> down x3 -> ... -> up` |
 | Atomicidade wallet/ledger/inbox/outbox | `test/integration/outbox.test.ts` | `BET grava eventos na mesma transação; falha depois do insert da outbox não deixa nada` |
 | Inbox e redelivery | `test/integration/sqs-consumer.test.ts` | `mesma mensagem 2x ...`; `mesmo externalTransactionId e key, messageId novo ...` |
 | Retry e DLQ | `test/integration/sqs-consumer.test.ts` | `erro transitório => visibilidade com backoff, sem delete; após maxReceiveCount vai à DLQ por redrive`; `JSON quebrado, schema inválido, OPENING e messageId reaproveitado com outro payload => DLQ explícita` |

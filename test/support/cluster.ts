@@ -35,7 +35,8 @@ function freePort(): number {
   return port;
 }
 
-async function pump(stream: ReadableStream<Uint8Array>, sink: string[]) {
+/** `max` limita as linhas guardadas (teste de carga: só a cauda, para diagnóstico, sem crescer a memória). */
+async function pump(stream: ReadableStream<Uint8Array>, sink: string[], max = Infinity) {
   const dec = new TextDecoder();
   let buf = '';
   for await (const chunk of stream) {
@@ -44,6 +45,7 @@ async function pump(stream: ReadableStream<Uint8Array>, sink: string[]) {
       sink.push(buf.slice(0, i));
       buf = buf.slice(i + 1);
     }
+    if (sink.length > 2 * max) sink.splice(0, sink.length - max);
   }
   if (buf) sink.push(buf);
 }
@@ -57,9 +59,10 @@ export class Instance {
     readonly name: string,
     readonly port: number,
     readonly proc: Subprocess<'ignore', 'pipe', 'pipe'>,
+    maxLogLines = Infinity,
   ) {
     live.add(proc);
-    const streams = Promise.all([pump(proc.stdout, this.logs), pump(proc.stderr, this.logs)]);
+    const streams = Promise.all([pump(proc.stdout, this.logs, maxLogLines), pump(proc.stderr, this.logs, maxLogLines)]);
     // código de saída depois de drenar a saída (diagnóstico completo)
     this.exited = proc.exited.then(async (code) => {
       live.delete(proc);
@@ -91,7 +94,10 @@ export class Cluster {
   readonly all: Instance[] = [];
   private seq = 0;
 
-  constructor(private readonly env: Record<string, string> = {}) {}
+  constructor(
+    private readonly env: Record<string, string> = {},
+    private readonly maxLogLines = Infinity,
+  ) {}
 
   /** Instâncias vivas, na ordem de criação. */
   get alive() {
@@ -109,7 +115,7 @@ export class Cluster {
         stdout: 'pipe',
         stderr: 'pipe',
       });
-      const inst = new Instance(name, port, proc);
+      const inst = new Instance(name, port, proc, this.maxLogLines);
       this.all.push(inst);
       try {
         await this.waitReady(inst, readyTimeoutMs);
@@ -157,8 +163,8 @@ export class Cluster {
 }
 
 /** Roda o cenário com um cluster novo; em falha imprime os logs; sempre mata tudo. */
-export async function withCluster<T>(env: Record<string, string>, fn: (c: Cluster) => Promise<T>): Promise<T> {
-  const c = new Cluster(env);
+export async function withCluster<T>(env: Record<string, string>, fn: (c: Cluster) => Promise<T>, maxLogLines?: number): Promise<T> {
+  const c = new Cluster(env, maxLogLines);
   try {
     return await fn(c);
   } catch (e) {

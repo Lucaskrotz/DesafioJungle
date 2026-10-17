@@ -266,13 +266,14 @@ describe('migrations reversíveis', () => {
     await admin.close();
   });
 
-  test('up -> 6 tabelas -> down x2 -> só mikro_orm_migrations e sem funções -> up', async () => {
+  test('up -> 6 tabelas -> down x3 -> só mikro_orm_migrations e sem funções -> up', async () => {
     // 5 tabelas de domínio + a de controle do migrator
     const all = ['inbox_messages', 'outbox_messages', 'wager_transactions', 'wallet_ledger_entries', 'wallets', 'mikro_orm_migrations'].sort();
     const m = tmp.getMigrator();
     await m.up();
     expect(await tables()).toEqual(all);
-    // down desfaz uma migration por vez: são duas
+    // down desfaz uma migration por vez: são três
+    await m.down();
     await m.down();
     await m.down();
     expect(await tables()).toEqual(['mikro_orm_migrations']);

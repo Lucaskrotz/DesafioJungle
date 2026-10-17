@@ -204,7 +204,7 @@ erDiagram
 | Triggers `ledger_no_update_delete` (linha) e `ledger_no_truncate` (statement) → `ledger_immutable()` | `wallet_ledger_entries` | Append-only: `UPDATE`, `DELETE` e `TRUNCATE` falham | Restrição 5: ledger nunca sobrescrito nem excluído. |
 | `PRIMARY KEY (consumer_name, message_id)` | `inbox_messages` | Uma entrada por mensagem por consumidor | Deduplicação persistente do SQS. |
 | `id uuid PRIMARY KEY` (= eventId), `seq bigserial UNIQUE` | `outbox_messages` | Evento único; ordem de inserção | `seq` ordena a publicação. |
-| `outbox_pending_idx (next_attempt_at, seq) WHERE published_at IS NULL` | `outbox_messages` | - | Claim barato só sobre pendentes. |
+| `outbox_pending_seq_idx (seq) WHERE published_at IS NULL` | `outbox_messages` | - | Claim barato só sobre pendentes, já na ordem de `seq` (migration 3; substituiu `outbox_pending_idx (next_attempt_at, seq)`). |
 
 O que o banco não garante sozinho: que `wallets.balance` seja igual à soma do ledger (garantido pelo código na mesma transação e verificado pela reconciliação), e que `version` só mude junto com o saldo (garantido pelo agregado). `wallets` não tem trigger de imutabilidade: o saldo precisa ser atualizável. `wager_transactions` também recusa `TRUNCATE` (trigger `wager_transactions_no_truncate`, statement, migration 2).
 
@@ -250,7 +250,7 @@ Como todos adquirem na mesma ordem e a referência pertence (em todo caso válid
 
 ### Hot wallet e trade-offs
 
-- Throughput por wallet é serial: uma transação por vez segura o lock durante a seção crítica. Como referência (não é teste de carga), na sessão de exemplos do README o caso de uso inteiro, do início ao commit, levou menos de 10 ms em 9 de 16 requisições e menos de 25 ms em todas (`wager_processing_duration_seconds`).
+- Throughput por wallet é serial: uma transação por vez segura o lock durante a seção crítica. No teste de carga (cenário B de [LOAD_TEST.md](LOAD_TEST.md)) isso deu ~110-135 BETs/s numa única wallet, ~7-9 ms por seção crítica, sem nenhum `lock_timeout`. Como referência anterior, na sessão de exemplos do README o caso de uso inteiro, do início ao commit, levou menos de 10 ms em 9 de 16 requisições e menos de 25 ms em todas (`wager_processing_duration_seconds`).
 - Requisições na fila de uma wallet quente seguram uma conexão do pool cada uma. Com `DB_POOL_MAX=20`, uma wallet muito quente pode ocupar o pool de uma instância e atrasar outras wallets daquela instância.
 - Se a fila de uma wallet passar de 3 s, `lock_timeout` dispara, há até 3 tentativas e depois 503. O teste `phase6 1.` (200 BETs simultâneas na mesma wallet, em 4 processos) termina sem nenhum 5xx; `phase4 hot wallet: 100 BETs de 1.00 em 60.00` dá exatamente 60 processadas e 40 rejeitadas.
 - No consumidor SQS, mensagens do mesmo `MessageGroupId` (wallet) são processadas em sequência; grupos distintos em paralelo até `CONSUMER_CONCURRENCY`.
@@ -441,7 +441,8 @@ Para uma mensagem SQS, a mesma transação SQL contém: `INSERT inbox_messages`,
 - Claim: `published_at IS NULL AND next_attempt_at <= now()`, `ORDER BY seq`, `LIMIT 25`, `FOR UPDATE SKIP LOCKED`. Publishers concorrentes pegam linhas disjuntas, sem lock global e sem esperar uns pelos outros.
 - Envio sequencial dentro do lote: `MessageGroupId = aggregateId` (walletId), `MessageDeduplicationId = eventId`.
 - Sucesso: `published_at`. Falha de uma linha: `attempts + 1`, `next_attempt_at = now + min(1 s · 2^attempts, 60 s)` (`outboxBackoffMs`), e o lote segue. Não há limite de tentativas nem "dead letter" da outbox.
-- Intervalo de 500 ms (`OUTBOX_POLL_MS`) via `PollLoop` (`setTimeout` encadeado, ciclos nunca se sobrepõem).
+- Intervalo de 500 ms (`OUTBOX_POLL_MS`) via `PollLoop` (`setTimeout` encadeado, ciclos nunca se sobrepõem). Se o ciclo publicou um lote cheio (25), o próximo começa sem esperar o intervalo (modo de drenagem); antes disso o teto era 50 eventos/s por instância, qualquer que fosse o backlog.
+- O claim é servido pelo índice parcial `outbox_pending_seq_idx (seq) WHERE published_at IS NULL`. Com o índice anterior, `(next_attempt_at, seq)`, o planner varria `outbox_messages_seq_key` desde o começo, pulando todas as linhas já publicadas: 211 ms por claim com ~314 mil linhas, crescendo com a tabela (achado do teste de carga; ver [LOAD_TEST.md](LOAD_TEST.md)).
 
 ### Crash depois do commit
 
@@ -622,10 +623,11 @@ sequenceDiagram
 
 | Camada | Arquivos | Real | Testes |
 |---|---|---|---|
-| Unidade | `test/unit/*` | domínio puro; reconciliação com snapshot simulado | 82 |
-| Integração | `test/integration/*` | Postgres 16 e LocalStack reais; app Nest real (`createApp`, `listen(0)`); filas temporárias por teste | 77 |
+| Unidade | `test/unit/*` | domínio puro; reconciliação com snapshot simulado; `PollLoop` | 84 |
+| Integração | `test/integration/*` | Postgres 16 e LocalStack reais; app Nest real (`createApp`, `listen(0)`); filas temporárias por teste | 79 |
 | Concorrência | `test/concurrency/phase4.test.ts` | caso de uso e HTTP com `Promise.all` (paralelismo real no banco) | 37 |
 | Concorrência multi-processo | `test/concurrency/phase6.test.ts` | processos `bun src/main.ts` via `Bun.spawn` (`test/support/cluster.ts`), portas livres, `SIGKILL`/`SIGTERM` reais | 7 |
+| Carga (sob demanda, `bun run test:load`) | `test/load/load-test.ts` | 1 e 3 processos reais, laço fechado, wallets espalhadas, hot wallet, drenagem SQS; invariantes conferidas no banco ao fim de cada cenário | - |
 
 - Nenhum teste substitui o Postgres ou o SQS por mock. Falhas são injetadas em pontos estreitos, com o resto real: um `UnitOfWork` que lança `TransientInfrastructureError` (`sqs-consumer.test.ts > erro transitório...`, o único stub de infraestrutura), um erro `40P01` lançado dentro de uma transação real (`observability.test.ts`), uma subclasse do publisher que falha em `markPublished`, uma fila inexistente para simular falha de publicação, um `UnitOfWork` que lança depois de gravar tudo (atomicidade), o gancho `beforeAck` e `FAULT_EXIT_BEFORE_ACK`.
 - Determinismo: o worker de `PENDING_REFERENCE` e o publisher aceitam `now` injetado, então os testes avançam o relógio sem dormir; esperas usam `eventually` com prazo, não `sleep` cego.
@@ -645,7 +647,10 @@ sequenceDiagram
 - **Outbox sem limite de tentativas**: um evento que nunca publica fica em backoff de 60 s para sempre (visível em `wager_outbox_lag_seconds`).
 - **Gauges best-effort**: `wager_outbox_pending`, `wager_outbox_lag_seconds` e `wager_dlq_depth` mantêm o último valor se a sonda falhar.
 - **Pool de conexões vs. instâncias**: `DB_POOL_MAX=20` por instância e `max_connections=200` no Postgres do compose. Com muitas réplicas é preciso ajustar ou usar PgBouncer (em modo transação, `SET LOCAL` continua válido). Hot wallet consome uma conexão por requisição em espera.
-- **Wallets quentes serializam**: throughput por wallet é limitado pela seção crítica; fila maior que 3 s vira retry e depois 503.
+- **Wallets quentes serializam**: throughput por wallet é limitado pela seção crítica; fila maior que 3 s vira retry e depois 503. Medido: ~110-135 BETs/s numa wallet, sem ganho (até perda) com 3 instâncias ([LOAD_TEST.md](LOAD_TEST.md)).
+- **Capacidade medida baixa e limitada pela CPU do processo**: no teste de carga (tudo na mesma máquina) uma instância satura em ~200-270 req/s com ~1,55 core de CPU; 3 instâncias dão 1,6-1,8x. O custo de CPU por requisição na aplicação (~6 ms) não foi perfilado.
+- **Publisher dentro do processo da API**: sob carga ele disputa o event loop e o pool com as requisições; publica ~50-60 eventos/s por instância enquanto a API gera ~2 eventos por transação, então o lag da outbox cresce durante toda a carga e só drena depois (20-25 s após 15 s de carga no cenário A). Desligar os workers aumentou o throughput da API em ~20-35%.
+- **Consumidor SQS em pare-e-espere**: um `ReceiveMessage` por vez, processa o lote e só então recebe de novo; ~65 mensagens/s por instância no LocalStack.
 - **Single-region, single-database**: o Postgres é o ponto de coordenação e de falha. Sem réplicas de leitura nem failover configurado.
 - **Sem particionamento** de ledger, transações ou outbox; crescimento contínuo.
 - **Sem retenção**: `inbox_messages` e `outbox_messages` publicadas nunca são limpas.
@@ -665,7 +670,7 @@ sequenceDiagram
 
 1. **Publisher com claim por lease** (`locked_until`, `locked_by`), publicação fora da transação e marcação em lote; ou outbox via CDC (Debezium lendo o WAL) para tirar o polling do banco.
 2. **Retenção e particionamento**: particionar `wallet_ledger_entries`, `wager_transactions` e `outbox_messages` por tempo; job de limpeza do inbox (janela maior que a de redelivery) e da outbox publicada.
-3. **Teste de carga `bun run test:load`**: N instâncias, mistura de wallets frias e quentes, p50/p95/p99, taxa de 503, `wager_lock_conflicts_total`, `wager_outbox_lag_seconds`; documentar o ponto em que o pool satura.
+3. **Capacidade, a partir do teste de carga** ([LOAD_TEST.md](LOAD_TEST.md)): perfilar a CPU por requisição (Nest/express, MikroORM, zod, pino); publisher com `SendMessageBatch` e em processo separado da API; consumidor com receives em pipeline; métrica de tempo de espera de lock (hoje só timeouts e deadlocks são contados); repetir o teste com gerador, aplicação e banco em máquinas separadas e em laço aberto.
 4. **Autenticação real** conforme a seção o, com Keycloak no compose e testes de 401/403.
 5. **OpenTelemetry**: traces do HTTP/SQS até o commit e a publicação, com `correlationId`/`causationId` como atributos; dashboard.
 6. **Rate limiting** por provedor (token bucket no gateway ou no Postgres/Redis).

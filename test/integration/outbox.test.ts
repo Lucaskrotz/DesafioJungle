@@ -10,7 +10,7 @@ import { HealthController } from '../../src/infrastructure/http/health.controlle
 import { createOrm, type Orm } from '../../src/infrastructure/mikro-orm/orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/mikro-orm/unit-of-work';
 import { createSqsClient, Sqs } from '../../src/infrastructure/sqs/sqs.client';
-import { OutboxPublisher } from '../../src/infrastructure/workers/outbox-publisher';
+import { CLAIM_SQL, OutboxPublisher } from '../../src/infrastructure/workers/outbox-publisher';
 
 // Requer Postgres migrado e LocalStack com as filas de infra/localstack-init.sh.
 let orm: Orm;
@@ -307,4 +307,17 @@ describe('readiness com SQS', () => {
     expect(await new HealthController(orm, sqs).ready()).toEqual({ status: 'ok', checks: { postgres: 'up', sqs: 'up' } });
     down.client.destroy();
   });
+});
+
+// Regressão achada no teste de carga: o claim varria outbox_messages_seq_key desde o início, pulando
+// todas as linhas publicadas (~200 ms por ciclo com 300 mil linhas). Sem seq scan (tabela pequena em
+// banco novo), o planner deve usar o índice parcial em seq, e não o índice único de seq inteiro.
+test('claim da outbox usa o índice parcial dos pendentes', async () => {
+  const plan = await orm.em.fork().transactional(async (em) => {
+    await em.execute(`SET LOCAL enable_seqscan = off`);
+    return (await em.execute(`EXPLAIN ${CLAIM_SQL}`, [null, 25])) as { 'QUERY PLAN': string }[];
+  });
+  const text = plan.map((r) => r['QUERY PLAN']).join('\n');
+  expect(text).toContain('outbox_pending_seq_idx');
+  expect(text).not.toContain('outbox_messages_seq_key');
 });

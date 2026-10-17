@@ -1,7 +1,10 @@
 import type { LoggerPort } from '../../application/ports';
 import { errFields } from '../observability/logger';
 
-/** Loop com setTimeout encadeado: nunca sobrepõe ciclos; stop() espera o ciclo em andamento. */
+/**
+ * Loop com setTimeout encadeado: nunca sobrepõe ciclos; stop() espera o ciclo em andamento.
+ * Se o ciclo devolve `true` (há mais trabalho, ex.: lote cheio), o próximo começa sem esperar o intervalo.
+ */
 export class PollLoop {
   private timer?: ReturnType<typeof setTimeout>;
   private current?: Promise<void>;
@@ -27,13 +30,14 @@ export class PollLoop {
 
   private schedule(ms: number) {
     this.timer = setTimeout(() => {
+      let more = false;
       this.current = this.tick()
         .then(
-          () => undefined,
+          (r) => void (more = r === true),
           (e) => this.logger.error(errFields(e), 'poll cycle failed'),
         )
         .finally(() => {
-          if (this.running) this.schedule(this.intervalMs);
+          if (this.running) this.schedule(more ? 0 : this.intervalMs);
         });
     }, ms);
   }

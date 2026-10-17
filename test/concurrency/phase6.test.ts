@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { DeleteMessageBatchCommand, ReceiveMessageCommand, SendMessageBatchCommand } from '@aws-sdk/client-sqs';
+import { DeleteMessageBatchCommand, ReceiveMessageCommand } from '@aws-sdk/client-sqs';
 import { OpenWalletUseCase } from '../../src/application/open-wallet';
 import type { SubmitWagerCommand } from '../../src/application/submit-wager-transaction';
 import { createOrm, type Orm } from '../../src/infrastructure/mikro-orm/orm.config';
@@ -8,7 +8,16 @@ import { Sqs } from '../../src/infrastructure/sqs/sqs.client';
 import { CONSUMER_NAME } from '../../src/infrastructure/sqs/wager-consumer';
 import { eventually, withCluster, within, type Cluster, type Instance } from '../support/cluster';
 import { assertWalletConsistent } from '../support/invariants';
-import { deleteQueues, queueCounts, sendMessage, tempFifo, tempQueues, type Queues } from '../support/sqs';
+import {
+  queueCounts,
+  queueEnv,
+  sendBatch as sendSqsBatch,
+  sendMessage,
+  toMessage,
+  withQueues,
+  type Msg,
+  type ScenarioQueues,
+} from '../support/sqs';
 
 // Processos reais (`bun src/main.ts`) contra Postgres migrado e LocalStack. Cada teste cria filas FIFO
 // próprias (principal com redrive para DLQ + eventos) e mata todas as instâncias no fim, inclusive em falha.
@@ -56,27 +65,7 @@ async function newWallet(initial: string) {
   return { id, cmd };
 }
 
-type Msg = { messageId: string; type: 'WagerTransactionRequested'; occurredAt: string; data: SubmitWagerCommand };
-const toMessage = (data: SubmitWagerCommand, messageId = uid()): Msg => ({
-  messageId,
-  type: 'WagerTransactionRequested',
-  occurredAt: new Date().toISOString(),
-  data,
-});
-
-/** Envia em lotes de 10; dedup id sempre novo (reenvio de um mesmo messageId chega de fato duplicado). */
-async function sendBatch(url: string, items: { body: Msg; group: string }[]) {
-  for (let i = 0; i < items.length; i += 10) {
-    const Entries = items.slice(i, i + 10).map((it, j) => ({
-      Id: String(j),
-      MessageBody: JSON.stringify(it.body),
-      MessageGroupId: it.group,
-      MessageDeduplicationId: uid(),
-    }));
-    const r = await sqs.client.send(new SendMessageBatchCommand({ QueueUrl: url, Entries }));
-    expect(r.Failed ?? []).toHaveLength(0);
-  }
-}
+const sendBatch = (url: string, items: { body: Msg; group: string }[]) => sendSqsBatch(sqs, url, items);
 
 type Res = { status: number; json: any };
 async function post(inst: Instance, c: SubmitWagerCommand): Promise<Res> {
@@ -110,27 +99,13 @@ const drained = async (url: string) => {
   return true;
 };
 
-type Ctx = { c: Cluster; qs: Queues; events: { name: string; url: string } };
+type Ctx = { c: Cluster } & ScenarioQueues;
 /** Filas próprias + cluster; ao fim mata as instâncias e apaga as filas. */
-async function scenario(opts: { visibility?: number; env?: Record<string, string> }, fn: (ctx: Ctx) => Promise<void>) {
-  const qs = await tempQueues(sqs, { visibility: opts.visibility ?? 3, maxReceiveCount: 5 });
-  const events = await tempFifo(sqs, 'we');
-  const env = {
-    RUN_WORKERS: '1',
-    SQS_TRANSACTIONS_QUEUE: qs.name,
-    SQS_TRANSACTIONS_DLQ: qs.dlqName,
-    SQS_EVENTS_QUEUE: events.name,
-    OUTBOX_POLL_MS: '200',
-    PENDING_REFERENCE_POLL_MS: '300',
-    DB_POOL_MAX: '10',
-    ...opts.env,
-  };
-  try {
-    await withCluster(env, (c) => fn({ c, qs, events }));
-  } finally {
-    await deleteQueues(sqs, [...qs.urls, events.url]);
-  }
-}
+const scenario = (opts: { visibility?: number; env?: Record<string, string> }, fn: (ctx: Ctx) => Promise<void>) =>
+  withQueues(sqs, { visibility: opts.visibility }, (q) => {
+    const env = { RUN_WORKERS: '1', ...queueEnv(q), OUTBOX_POLL_MS: '200', PENDING_REFERENCE_POLL_MS: '300', DB_POOL_MAX: '10', ...opts.env };
+    return withCluster(env, (c) => fn({ c, ...q }));
+  });
 
 test('1. quatro instâncias HTTP: 80+80, mesma key x50, hot wallet e 20 wallets em paralelo', () =>
   scenario({ env: { RUN_WORKERS: '0' } }, async ({ c }) => {

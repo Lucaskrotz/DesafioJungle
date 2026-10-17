@@ -11,6 +11,7 @@
     "test:unit": "bun test test/unit",
     "test:integration": "bun test --timeout 60000 --max-concurrency 1 test/integration",
     "test:concurrency": "bun test --timeout 120000 --max-concurrency 1 test/concurrency",
+    "test:load": "bun test/load/load-test.ts",
     "migration:up": "bun src/infrastructure/mikro-orm/migrate.ts up",
     "migration:down": "bun src/infrastructure/mikro-orm/migrate.ts down",
     "infra:up": "docker compose up -d --wait postgres localstack",

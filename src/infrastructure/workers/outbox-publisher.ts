@@ -18,7 +18,8 @@ export interface OutboxPublisherOptions {
 }
 
 // Pendentes e vencidas; SKIP LOCKED reparte o trabalho entre publishers sem lock global.
-const CLAIM_SQL = `
+// Servida por outbox_pending_seq_idx (parcial em seq): não varre as linhas já publicadas.
+export const CLAIM_SQL = `
   SELECT id, aggregate_id AS "aggregateId", event_type AS "eventType", payload, occurred_at AS "occurredAt",
          attempts, next_attempt_at AS "nextAttemptAt", published_at AS "publishedAt"
     FROM outbox_messages
@@ -61,7 +62,8 @@ export class OutboxPublisher {
     this.queueName = opts.queueName ?? loadConfig().eventsQueue;
     this.batchSize = opts.batchSize ?? 25;
     this.metrics = opts.metrics ?? noopObservability.metrics;
-    this.loop = new PollLoop(() => this.runOnce(), opts.intervalMs ?? 500, this.logger);
+    // lote cheio publicado = provável backlog: drena sem esperar o intervalo (falhas entram em backoff e não giram)
+    this.loop = new PollLoop(async () => (await this.runOnce()).published === this.batchSize, opts.intervalMs ?? 500, this.logger);
   }
 
   start(): void {
