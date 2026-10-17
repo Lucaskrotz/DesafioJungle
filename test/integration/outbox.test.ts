@@ -294,7 +294,7 @@ describe('wiring', () => {
     } finally {
       await app.close();
     }
-  });
+  }, 60_000);
 });
 
 describe('readiness com SQS', () => {

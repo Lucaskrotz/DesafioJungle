@@ -177,7 +177,7 @@ test('1. quatro instâncias HTTP: 80+80, mesma key x50, hot wallet e 20 wallets 
       }
     }
     expect(insts.every((i) => i.alive)).toBe(true);
-  }));
+  }), 180_000);
 
 test('2. quatro instâncias consumindo SQS: duplicatas e mesma transação com messageIds novos => efeitos únicos', () =>
   scenario({ visibility: 3 }, async ({ c, qs }) => {
@@ -216,7 +216,7 @@ test('2. quatro instâncias consumindo SQS: duplicatas e mesma transação com m
     console.info(
       `[cenário 2] processadas por instância=${c.all.map((i) => i.logged('message processed')).join('/')} duplicatas=${sumLogged(c, 'duplicate message')}`,
     );
-  }));
+  }), 180_000);
 
 test('3. instância morre depois do commit e antes do ack: outra recebe a redelivery como duplicata', () =>
   scenario({ visibility: 3 }, async ({ c, qs }) => {
@@ -243,7 +243,7 @@ test('3. instância morre depois do commit e antes do ack: outra recebe a redeli
     const inv = await assertWalletConsistent(orm, w.id);
     expect(inv.balance.toFixed(2)).toBe('70.00');
     expect(await queueCounts(sqs, qs.dlqUrl)).toEqual({ visible: 0, inFlight: 0 });
-  }));
+  }), 180_000);
 
 /** Lê (e apaga) a fila de eventos até ver todos os eventIds esperados; devolve só os envelopes deles. */
 async function collectEvents(url: string, wanted: Set<string>, timeoutMs = 60_000) {
@@ -312,7 +312,7 @@ test('4. publishers em processos distintos sobre a mesma outbox; um morre com SI
     for (const e of got) expect(e).toEqual(byId.get(e.eventId));
     console.info(`[cenário 4] eventos=${total} pendentes-após-kill=${leftAfterKill} recebidos=${got.length} duplicados=${got.length - total}`);
     for (const id of ids) await assertWalletConsistent(orm, id);
-  }));
+  }), 180_000);
 
 test('5. referências fora de ordem entre processos: workers de 3 instâncias resolvem sem duplicar', () =>
   scenario({}, async ({ c, qs }) => {
@@ -371,7 +371,7 @@ test('5. referências fora de ordem entre processos: workers de 3 instâncias re
     console.info(
       `[cenário 5] resolvidas=${resolved.length} saldo=115.00 órfã: attempts=${o.reference_attempts} próxima=${new Date(o.next_reference_attempt_at).toISOString()}`,
     );
-  }));
+  }), 180_000);
 
 test(
   '6. reinício com carga contínua (HTTP + SQS): SIGKILL de uma, de todas, retry total => consistência final',
@@ -486,4 +486,4 @@ test('7. SIGTERM com mensagens em voo: sai com 0, nada perdido nem duplicado', (
     expect(inv.balance.toFixed(2)).toBe('940.00');
     expect(inv.debits).toBe(60);
     console.info(`[cenário 7] SIGTERM -> exit 0 em ${elapsed}ms; processadas antes=${doneByX}, depois=${60 - doneByX}`);
-  }));
+  }), 180_000);

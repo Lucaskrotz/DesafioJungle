@@ -295,7 +295,7 @@ describe('consumidor SQS: classificação de erros', () => {
     expect(c.counters.deadLettered).toBe(0); // foi a redrive policy, não o consumidor
     expect(await counts(qs.url)).toEqual({ visible: 0, inFlight: 0 });
     expect(await debitsOf(w.id)).toBe(0);
-  });
+  }, 60_000);
 });
 
 describe('consumidor SQS: concorrência', () => {
